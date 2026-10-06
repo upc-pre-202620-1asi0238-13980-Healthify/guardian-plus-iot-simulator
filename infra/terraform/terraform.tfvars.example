@@ -1,0 +1,18 @@
+project_id = "my-gcp-project"
+
+# who can reach the API (5000) and the broker (1883, WebSocket 9001): your IP and the backend VM's IP,
+# since the backend subscribes to the telemetry over WebSocket
+allowed_source_ranges = ["203.0.113.10/32"]
+
+backend_devices_url = "http://<backend-host>:8080/api/v1/wearable-devices"
+
+# rate limiter: max messages/second to the broker (critical alerts are never held back)
+mqtt_max_rate = 20
+mqtt_burst    = 20
+
+# keep the last message of every topic in the broker for late subscribers
+mqtt_retain = true
+
+# publish to an existing broker instead of installing Mosquitto on the VM
+# deploy_broker      = false
+# external_mqtt_host = "broker.example.com"

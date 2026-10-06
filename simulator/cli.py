@@ -100,6 +100,12 @@ def _render_stats(stats):
         f"  awaiting confirm  {mqtt_stats['pending']}",
         f"  critical alerts   {_color(str(mqtt_stats['criticalAlerts']), RED if mqtt_stats['criticalAlerts'] else DIM)}",
         f"  last signal       {_ago(mqtt_stats['lastPublishAt'])}",
+    ]
+    rate = mqtt_stats.get("rateLimit") or {}
+    if rate.get("maxPerSecond"):
+        lines.append(f"  rate limit        {rate['maxPerSecond']}/s burst {rate['burst']}, "
+                     f"throttled {rate['throttled']} ({rate['throttledSeconds']}s)")
+    lines += [
         "",
         "By channel        " + "  ".join(f"{c}={by_channel.get(c, 0)}" for c in CHANNELS),
     ]
@@ -179,6 +185,7 @@ def cmd_serve(args):
     publisher = MqttPublisher(
         host=args.mqtt_host, port=args.mqtt_port, topic_prefix=args.topic_prefix,
         alerts_qos=args.alerts_qos, telemetry_qos=args.telemetry_qos,
+        max_rate=args.max_rate, burst=args.burst, retain=args.retain,
     )
     api = SimulatorApi(
         generator=generator,
@@ -399,7 +406,7 @@ def build_parser():
     p.add_argument("--mqtt-port", type=int, default=MQTT_PORT)
     p.add_argument("--topic-prefix", default=TOPIC_PREFIX)
     p.add_argument("--backend-url", default=BACKEND_DEVICES_URL)
-    p.add_argument("--interval", type=int, default=int(os.environ.get("EMIT_INTERVAL_SECONDS", 10)),
+    p.add_argument("--interval", type=int, default=int(os.environ.get("EMIT_INTERVAL_SECONDS", 3)),
                    help="seconds between simulation cycles")
     p.add_argument("--minutes-per-tick", type=float, default=5.0,
                    help="simulated minutes each cycle represents")
@@ -413,6 +420,13 @@ def build_parser():
     p.add_argument("--battery-drain", type=float, default=0.35, help="battery %% lost per cycle")
     p.add_argument("--alerts-qos", type=int, choices=[0, 1, 2], default=1)
     p.add_argument("--telemetry-qos", type=int, choices=[0, 1, 2], default=0)
+    p.add_argument("--max-rate", type=float, default=float(os.environ.get("MQTT_MAX_RATE", 0)),
+                   help="max messages per second to the broker, 0 = unlimited (critical alerts are never held back)")
+    p.add_argument("--burst", type=int, default=int(os.environ.get("MQTT_BURST", 20)),
+                   help="messages allowed in a burst before the rate limit kicks in")
+    p.add_argument("--retain", action="store_true",
+                   default=os.environ.get("MQTT_RETAIN", "").lower() in ("1", "true", "yes"),
+                   help="publish with the retain flag so the broker keeps the last message per topic")
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=cmd_serve)
 
