@@ -54,6 +54,9 @@ Configuration comes from flags or environment variables:
 | — | `--safe-zone-radius` | `200` (meters) |
 | — | `--battery-drain` | `0.35` (% per cycle) |
 | — | `--alerts-qos` / `--telemetry-qos` | `1` / `0` |
+| `MQTT_MAX_RATE` | `--max-rate` | `0` (messages/second to the broker, 0 = no limit) |
+| `MQTT_BURST` | `--burst` | `20` (messages allowed in a burst) |
+| `MQTT_RETAIN` | `--retain` | off (broker keeps the last message per topic) |
 
 > On macOS, port 5000 is taken by the AirPlay Receiver. Use `--port 5055` or
 > disable it in System Settings.
@@ -86,6 +89,11 @@ Signals are published to `guardian/<channel>/<deviceId>`, e.g.
 
 Critical alerts (`severity: "CRITICAL"`) are published with **QoS 1** — losing a
 fall or an SOS is not an option — while routine telemetry uses QoS 0.
+
+`--max-rate` turns on a token-bucket rate limiter in front of the broker. Telemetry
+over the limit waits for its turn instead of being dropped, so nothing is lost; it
+just gets spaced out. Critical alerts never wait. `stats` shows how many messages
+were held back and for how long.
 
 ## Clinical thresholds
 
@@ -208,3 +216,30 @@ python simulator/cli.py --url http://<vm-ip>:5000 watch
 
 Open port 5000 only to whoever needs to monitor it — the API has no authentication,
 and Flask's development server is not meant for production traffic.
+
+## Deploying to Google Cloud with Terraform
+
+`infra/terraform` creates a Debian 12 VM with a static IP, firewall rules and a
+minimal service account. On boot it installs Mosquitto and runs the simulator as
+systemd services:
+
+* **Broker** — Mosquitto with on-disk persistence. Persistent subscribers
+  (`clean_session=false`) get their QoS 1 messages queued while offline (up to
+  `broker_max_queued_messages`), and retained messages survive restarts.
+* **Simulator** — publishes to the local broker with the rate limiter on
+  (`mqtt_max_rate`, default 20 msg/s) and `retain` on.
+
+```bash
+cd infra/terraform
+cp terraform.tfvars.example terraform.tfvars   # set project_id, allowed_source_ranges, backend_devices_url
+terraform init
+terraform apply
+
+SIMULATOR_URL=$(terraform output -raw simulator_url) python ../../simulator/cli.py stats
+python ../../simulator/cli.py listen --mqtt-host $(terraform output -raw external_ip)
+```
+
+The broker allows anonymous access, so set `allowed_source_ranges` to the IPs that
+really need it. On the VM, `guardian-sim <command>` runs the CLI against the local
+simulator and `journalctl -u guardian-simulator -f` follows its logs. To use a
+broker you already have, set `deploy_broker = false` and `external_mqtt_host`.

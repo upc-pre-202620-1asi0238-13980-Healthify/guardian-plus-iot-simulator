@@ -1,0 +1,100 @@
+#!/bin/bash
+# Startup script de la VM: instala Mosquitto (opcional) y el simulador como
+# servicios systemd. Corre en cada arranque, asi que todo es idempotente.
+set -euo pipefail
+
+APP_DIR=/opt/guardian-plus-iot-simulator
+APP_USER=guardian
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q git python3 python3-venv %{ if deploy_broker }mosquitto mosquitto-clients%{ endif }
+
+%{ if deploy_broker ~}
+# ---------- broker ----------
+# persistencia en disco + sesiones persistentes: los mensajes QoS 1 de un
+# suscriptor con clean_session=false quedan encolados mientras esta caido, y los
+# retenidos sobreviven a un reinicio del broker
+cat > /etc/mosquitto/mosquitto.conf <<'EOF'
+pid_file /run/mosquitto/mosquitto.pid
+log_dest syslog
+log_type error
+log_type warning
+log_type notice
+
+listener ${mqtt_port} 0.0.0.0
+allow_anonymous true
+
+# MQTT sobre WebSocket para el suscriptor de telemetria del backend
+listener ${mqtt_ws_port} 0.0.0.0
+protocol websockets
+
+persistence true
+persistence_location /var/lib/mosquitto/
+autosave_interval 30
+persistent_client_expiration ${broker_session_expiry}
+
+max_queued_messages ${broker_max_queued_messages}
+max_inflight_messages 20
+message_size_limit 65536
+EOF
+systemctl enable mosquitto
+systemctl restart mosquitto
+%{ endif ~}
+
+# ---------- simulador ----------
+id -u "$APP_USER" >/dev/null 2>&1 || useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"
+
+if [ ! -d "$APP_DIR/.git" ]; then
+  git clone '${repo_url}' "$APP_DIR"
+fi
+git -C "$APP_DIR" fetch --tags origin '${repo_ref}'
+git -C "$APP_DIR" checkout -f FETCH_HEAD
+
+python3 -m venv "$APP_DIR/.venv"
+"$APP_DIR/.venv/bin/pip" install -q --upgrade pip
+"$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+
+cat > /etc/guardian-simulator.env <<'EOF'
+MQTT_HOST=${mqtt_host}
+MQTT_PORT=${mqtt_port}
+MQTT_TOPIC_PREFIX=${topic_prefix}
+MQTT_MAX_RATE=${mqtt_max_rate}
+MQTT_BURST=${mqtt_burst}
+MQTT_RETAIN=${mqtt_retain}
+BACKEND_DEVICES_URL=${backend_devices_url}
+SIMULATOR_PORT=${simulator_port}
+EMIT_INTERVAL_SECONDS=${emit_interval_seconds}
+SIMULATOR_URL=http://localhost:${simulator_port}
+PYTHONUNBUFFERED=1
+EOF
+
+cat > /etc/systemd/system/guardian-simulator.service <<EOF
+[Unit]
+Description=Guardian+ IoT wearable simulator
+After=network-online.target%{ if deploy_broker } mosquitto.service%{ endif }
+Wants=network-online.target
+
+[Service]
+User=$APP_USER
+WorkingDirectory=$APP_DIR
+EnvironmentFile=/etc/guardian-simulator.env
+ExecStart=$APP_DIR/.venv/bin/python simulator/cli.py serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# atajo para usar el CLI en la VM: `guardian-sim stats`, `guardian-sim signals`...
+cat > /usr/local/bin/guardian-sim <<EOF
+#!/bin/sh
+set -a; . /etc/guardian-simulator.env; set +a
+exec $APP_DIR/.venv/bin/python $APP_DIR/simulator/cli.py "\$@"
+EOF
+chmod +x /usr/local/bin/guardian-sim
+
+systemctl daemon-reload
+systemctl enable guardian-simulator
+systemctl restart guardian-simulator

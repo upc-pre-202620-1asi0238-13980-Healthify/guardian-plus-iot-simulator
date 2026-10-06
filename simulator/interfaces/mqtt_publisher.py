@@ -8,6 +8,7 @@ realmente salio del cliente, no solo de lo que se intento enviar.
 import json
 import logging
 import threading
+import time
 from collections import Counter, deque
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -32,16 +33,53 @@ def _rc_failed(reason_code) -> bool:
     return int(reason_code) != 0
 
 
+class RateLimiter:
+    """Token bucket: deja pasar `rate` mensajes por segundo con rafagas de hasta
+    `burst`. `acquire` espera al siguiente token en vez de descartar, asi que la
+    telemetria llega completa al broker, solo que espaciada."""
+
+    def __init__(self, rate: float, burst: int):
+        self.rate = rate
+        self.burst = max(1, burst)
+        self._tokens = float(self.burst)
+        self._updated = time.monotonic()
+        self._lock = threading.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return self.rate > 0
+
+    def acquire(self) -> float:
+        """Consume un token; devuelve los segundos que tuvo que esperar."""
+        if not self.enabled:
+            return 0.0
+        waited = 0.0
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self.burst, self._tokens + (now - self._updated) * self.rate)
+                self._updated = now
+                if self._tokens >= 1:
+                    self._tokens -= 1
+                    return waited
+                wait = (1 - self._tokens) / self.rate
+            time.sleep(wait)
+            waited += wait
+
+
 class MqttPublisher:
     """Publica señales al broker y registra que fue enviado de verdad."""
 
     def __init__(self, host: str, port: int = 1883, topic_prefix: str = "guardian",
-                 alerts_qos: int = 1, telemetry_qos: int = 0):
+                 alerts_qos: int = 1, telemetry_qos: int = 0,
+                 max_rate: float = 0, burst: int = 20, retain: bool = False):
         self._host = host
         self._port = port
         self._topic_prefix = topic_prefix.rstrip("/")
         self._alerts_qos = alerts_qos
         self._telemetry_qos = telemetry_qos
+        self._retain = retain
+        self._limiter = RateLimiter(max_rate, burst)
         self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
@@ -61,6 +99,8 @@ class MqttPublisher:
         self._recent: deque = deque(maxlen=RECENT_SIGNALS_SIZE)
         self._pending_mids = {}
         self._early_acks = set()
+        self._throttled_count = 0
+        self._throttled_seconds = 0.0
 
     # ---------- conexion ----------
 
@@ -115,8 +155,14 @@ class MqttPublisher:
         topic = self.topic_for(signal)
         # las alertas van con QoS 1: perder una caida o un SOS no es opcion
         qos = self._alerts_qos if signal.severity == "CRITICAL" else self._telemetry_qos
+        # las alertas criticas no esperan al rate limiter; el resto si
+        waited = 0.0 if signal.severity == "CRITICAL" else self._limiter.acquire()
+        if waited:
+            with self._lock:
+                self._throttled_count += 1
+                self._throttled_seconds += waited
         payload = json.dumps(signal.to_dict())
-        info = self._client.publish(topic, payload, qos=qos)
+        info = self._client.publish(topic, payload, qos=qos, retain=self._retain)
         sent = info.rc == mqtt.MQTT_ERR_SUCCESS
 
         record = {
@@ -197,6 +243,13 @@ class MqttPublisher:
                 "bySignalType": dict(self._by_signal_type.most_common()),
                 "lastPublishAt": self._last_publish_at,
                 "lastError": self._last_error,
+                "retain": self._retain,
+                "rateLimit": {
+                    "maxPerSecond": self._limiter.rate or None,
+                    "burst": self._limiter.burst,
+                    "throttled": self._throttled_count,
+                    "throttledSeconds": round(self._throttled_seconds, 2),
+                },
             }
 
     def recent_signals(self, limit: int = 10, channel: Optional[str] = None,
